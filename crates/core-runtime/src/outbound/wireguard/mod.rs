@@ -1514,16 +1514,14 @@ impl Stack {
     }
 
     fn maintain_tcp(&mut self) {
-        let ids: Vec<u32> = self.tcp.keys().copied().collect();
-        for id in ids {
-            let Some(mut conn) = self.tcp.remove(&id) else {
-                continue;
-            };
-            let mut rbuf = std::mem::take(&mut self.scratch);
+        let sockets = &mut self.sockets;
+        let scratch = &mut self.scratch;
+        self.tcp.retain(|_, conn| {
+            let mut rbuf = std::mem::take(scratch);
             let mut remote_closed = false;
             let mut caller_gone = false;
             let state = {
-                let sock = self.sockets.get_mut::<TcpSock<'static>>(conn.handle);
+                let sock = sockets.get_mut::<TcpSock<'static>>(conn.handle);
 
                 while let Some(front) = conn.from_caller.front_mut() {
                     match sock.send_slice(front) {
@@ -1569,7 +1567,7 @@ impl Stack {
                 }
                 sock.state()
             };
-            self.scratch = rbuf;
+            *scratch = rbuf;
 
             if let Some(stash) = conn.stash.take() {
                 match conn.to_caller.try_send(stash) {
@@ -1586,7 +1584,7 @@ impl Stack {
                 && let Some(resp) = conn.resp.take()
             {
                 let _ = resp.send(Ok(()));
-                self.sockets
+                sockets
                     .get_mut::<TcpSock<'static>>(conn.handle)
                     .set_timeout(None);
             }
@@ -1607,11 +1605,12 @@ impl Stack {
                 if let Some(resp) = conn.resp.take() {
                     let _ = resp.send(Err("connection closed".into()));
                 }
-                self.sockets.remove(conn.handle);
+                sockets.remove(conn.handle);
+                false
             } else {
-                self.tcp.insert(id, conn);
+                true
             }
-        }
+        });
     }
 
     async fn maintain_peers(&mut self) {
@@ -2150,6 +2149,95 @@ mod tests {
             scratch: vec![0; SCRATCH_BUF],
         };
         (stack, response, index, address)
+    }
+
+    async fn tcp_maintenance_fixture() -> Stack {
+        let (mut stack, _, _, _) = resumed_session_fixture().await;
+        stack.iface.update_ip_addrs(|list| {
+            for cidr in &stack.cfg.local_cidrs {
+                list.push(*cidr).unwrap();
+            }
+        });
+        stack
+    }
+
+    fn pending_tcp(
+        stack: &mut Stack,
+        id: u32,
+        capacity: usize,
+    ) -> (
+        mpsc::Receiver<bytes::Bytes>,
+        oneshot::Receiver<Result<(), String>>,
+    ) {
+        let (to_caller, received) = mpsc::channel(capacity);
+        let (resp, connected) = oneshot::channel();
+        stack.process_cmd(Cmd::TcpConnect {
+            id,
+            dst: "10.66.66.1:443".parse().unwrap(),
+            to_caller,
+            resp,
+        });
+        assert!(stack.tcp.contains_key(&id));
+        (received, connected)
+    }
+
+    #[tokio::test]
+    async fn tcp_maintenance_removes_finished_connections_and_keeps_pending_ones() {
+        let mut stack = tcp_maintenance_fixture().await;
+        let (_live, mut connected) = pending_tcp(&mut stack, 1, 1);
+        let (gone, mut gone_result) = pending_tcp(&mut stack, 2, 1);
+        let (_reset, mut reset_result) = pending_tcp(&mut stack, 3, 1);
+        drop(gone);
+        let reset_handle = stack.tcp[&3].handle;
+        stack
+            .sockets
+            .get_mut::<TcpSock<'static>>(reset_handle)
+            .abort();
+
+        // Both passes in the datapath must tolerate removal of other entries.
+        for _ in 0..2 {
+            stack.maintain_tcp();
+            assert_eq!(stack.tcp.len(), 1);
+            assert!(stack.tcp.contains_key(&1));
+            assert_eq!(stack.sockets.iter().count(), 1);
+        }
+        assert_eq!(
+            gone_result.try_recv().unwrap(),
+            Err("connection closed".into())
+        );
+        assert_eq!(
+            reset_result.try_recv().unwrap(),
+            Err("connection reset".into())
+        );
+        assert!(matches!(
+            connected.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn tcp_maintenance_preserves_backpressure_and_delivers_stash_once() {
+        let mut stack = tcp_maintenance_fixture().await;
+        let (mut received, _connected) = pending_tcp(&mut stack, 1, 1);
+        let conn = stack.tcp.get_mut(&1).unwrap();
+        conn.to_caller
+            .try_send(bytes::Bytes::from_static(b"first"))
+            .unwrap();
+        conn.stash = Some(bytes::Bytes::from_static(b"second"));
+
+        stack.maintain_tcp();
+        stack.maintain_tcp();
+        assert_eq!(stack.tcp[&1].stash.as_deref(), Some(b"second".as_slice()));
+        assert_eq!(received.try_recv().unwrap(), b"first".as_slice());
+        stack.maintain_tcp();
+        assert!(stack.tcp[&1].stash.is_none());
+        assert_eq!(received.try_recv().unwrap(), b"second".as_slice());
+        stack.maintain_tcp();
+        assert!(matches!(
+            received.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(stack.tcp.len(), 1);
     }
 
     #[tokio::test]
