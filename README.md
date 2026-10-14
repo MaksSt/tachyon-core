@@ -231,6 +231,10 @@ cargo zigbuild --target x86_64-unknown-linux-musl --release      # Мини-ПК
 
 **[GPL-3.0-only](LICENSE)**, унаследована от sing-box и sing-box-lx. `tachyon-core` — независимая разработка сообщества Tachyon, не аффилированная с SagerNet или Leadaxe. Авторские права на протоколы и спецификации sing-box принадлежат их законным авторам.
 
+## Передача прав на мои вклады
+
+Я, [MaksSt](https://github.com/MaksSt), согласен безвозмездно передать автору проекта [Dushnilin](https://github.com/Dushnilin) все принадлежащие мне исключительные права на мои уже предоставленные этому проекту вклады. Работаю за идею и оплаты за эти вклады не требую.
+
 <p align="center">
   <img src="assets/readme/footer_tachyon.svg" width="100%" alt="Tachyon Community Footer" />
 </p>
